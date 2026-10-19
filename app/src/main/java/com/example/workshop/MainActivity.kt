@@ -9,6 +9,7 @@ import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,6 +24,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -51,6 +54,7 @@ import com.example.workshop.data.AdminRepository
 import com.google.firebase.FirebaseApp
 import com.example.workshop.data.Staff
 import com.example.workshop.data.StaffRepository
+import com.example.workshop.data.Attendance
 import com.example.workshop.data.AttendanceRepository
 import com.example.workshop.data.WorkshopWifiSessionRepository
 import com.example.workshop.data.WorkshopDatabase
@@ -64,9 +68,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var adminRepository: AdminRepository
     private lateinit var staffRepository: StaffRepository
 
-    private lateinit var attendanceRepository: AttendanceRepository
+    lateinit var attendanceRepository: AttendanceRepository
 
-    private lateinit var workshopWifiSessionRepository: WorkshopWifiSessionRepository
+    lateinit var workshopWifiSessionRepository: WorkshopWifiSessionRepository
 
     private var wifiPermissionGranted = false
 
@@ -336,9 +340,36 @@ fun WorkshopApp(
         mutableStateOf<Staff?>(null)
     }
 
-    var screen by remember {
-        mutableStateOf("home")
+    val sessionPrefs = remember {
+        activity.getSharedPreferences(
+            "garage_session",
+            Context.MODE_PRIVATE
+        )
     }
+
+    var screen by remember {
+        mutableStateOf(
+            if (sessionPrefs.getBoolean("admin_logged_in", false)) {
+                "adminDashboard"
+            } else {
+                "home"
+            }
+        )
+    }
+
+    BackHandler(enabled = screen != "home") {
+        screen = when (screen) {
+            "adminLogin" -> "home"
+            "staffLogin" -> "home"
+            "adminDashboard" -> "home"
+            "staffManagement" -> "adminDashboard"
+            "staffHome" -> "home"
+            else -> "home"
+        }
+    }
+
+    val attendance by
+    attendanceViewModel.todayAttendance.collectAsState()
 
     /*
  * Check Wi-Fi when the application starts.
@@ -381,7 +412,13 @@ fun WorkshopApp(
                 },
 
                 onAdminLogin = {
-                    screen = "adminLogin"
+                    screen = if (
+                        sessionPrefs.getBoolean("admin_logged_in", false)
+                    ) {
+                        "adminDashboard"
+                    } else {
+                        "adminLogin"
+                    }
                 },
 
                 onStaffLogin = {
@@ -400,6 +437,10 @@ fun WorkshopApp(
                 },
 
                 onSuccess = {
+                    sessionPrefs.edit()
+                        .putBoolean("admin_logged_in", true)
+                        .apply()
+
                     screen = "adminDashboard"
                 }
             )
@@ -427,17 +468,28 @@ fun WorkshopApp(
 
                 LaunchedEffect(
                     wifiConnected,
-                    staff.id
+                    staff.id,
+                    attendance?.checkInTime,
+                    attendance?.checkOutTime
                 ) {
-                    if (wifiConnected) {
 
-                        workshopWifiSessionViewModel
-                            .startSession(staff.id)
+                    // Only track workshop Wi-Fi time
+                    // after the employee has checked in.
+                    if (
+                        attendance?.checkInTime != null &&
+                        attendance?.checkOutTime == null
+                    ) {
 
-                    } else {
+                        if (wifiConnected) {
 
-                        workshopWifiSessionViewModel
-                            .endSession(staff.id)
+                            workshopWifiSessionViewModel
+                                .startSession(staff.id)
+
+                        } else {
+
+                            workshopWifiSessionViewModel
+                                .endSession(staff.id)
+                        }
                     }
                 }
 
@@ -459,16 +511,35 @@ fun WorkshopApp(
             }
         }
 
-        "adminDashboard" -> {
 
+        "adminDashboard" -> {
             AdminDashboardScreen(
                 staffRepository = staffRepository,
-
+                attendanceRepository = activity.attendanceRepository,
+                workshopWifiSessionRepository =
+                    activity.workshopWifiSessionRepository,
+                onOpenStaffManagement = {
+                    screen = "staffManagement"
+                },
                 onLogout = {
+                    sessionPrefs.edit()
+                        .remove("admin_logged_in")
+                        .apply()
+
                     screen = "home"
                 }
             )
         }
+
+        "staffManagement" -> {
+            StaffManagementScreen(
+                staffRepository = staffRepository,
+                onBack = {
+                    screen = "adminDashboard"
+                }
+            )
+        }
+
     }
 }
 
@@ -874,9 +945,9 @@ fun StaffLoginScreen(
    ============================================================ */
 
 @Composable
-fun AdminDashboardScreen(
+fun StaffManagementScreen(
     staffRepository: StaffRepository,
-    onLogout: () -> Unit
+    onBack: () -> Unit
 ) {
 
     var staffList by remember {
@@ -925,15 +996,14 @@ fun AdminDashboardScreen(
         ) {
 
             Text(
-                text = "Admin Dashboard",
-                style =
-                    MaterialTheme.typography.headlineSmall
+                text = "Staff Management",
+                style = MaterialTheme.typography.headlineSmall
             )
 
             OutlinedButton(
-                onClick = onLogout
+                onClick = onBack
             ) {
-                Text("Logout")
+                Text("Back")
             }
         }
 
@@ -996,6 +1066,9 @@ fun AdminDashboardScreen(
                     it.id
                 }
             ) { staff ->
+
+
+
 
                 StaffCard(
                     staff = staff,
@@ -1113,6 +1186,350 @@ fun AdminDashboardScreen(
     }
 }
 
+
+@Composable
+fun AdminDashboardScreen(
+    staffRepository: StaffRepository,
+    attendanceRepository: AttendanceRepository,
+    workshopWifiSessionRepository: WorkshopWifiSessionRepository,
+    onOpenStaffManagement: () -> Unit,
+    onLogout: () -> Unit
+) {
+
+    var staffList by remember {
+        mutableStateOf<List<Staff>>(emptyList())
+    }
+
+    var loading by remember {
+        mutableStateOf(true)
+    }
+
+    val scope = rememberCoroutineScope()
+
+
+    var todayAttendance by remember {
+        mutableStateOf<List<Attendance>>(emptyList())
+    }
+
+    var workshopMinutesByStaff by remember {
+        mutableStateOf<Map<Int, Long>>(emptyMap())
+    }
+
+    var attendanceLoading by remember {
+        mutableStateOf(true)
+    }
+
+    var attendanceError by remember {
+        mutableStateOf<String?>(null)
+    }
+
+
+    fun formatWorkshopTime(minutes: Long): String {
+        val hours = minutes / 60
+        val remainingMinutes = minutes % 60
+        return "${hours}h ${remainingMinutes}m"
+    }
+
+
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            try {
+                staffList = staffRepository.getAllStaff()
+
+                val today = java.text.SimpleDateFormat(
+                    "yyyy-MM-dd",
+                    java.util.Locale.getDefault()
+                ).format(java.util.Date())
+
+                todayAttendance =
+                    attendanceRepository.getAllTodayAttendance(today)
+
+                val currentTime = java.util.Date()
+                val timeFormat = java.text.SimpleDateFormat(
+                    "hh:mm a",
+                    java.util.Locale.getDefault()
+                )
+
+                workshopMinutesByStaff = staffList.associate { staff ->
+                    val sessions = workshopWifiSessionRepository.getSessionsForDate(
+                        staffId = staff.id,
+                        date = today
+                    )
+
+
+                    val totalMinutes = sessions.sumOf { session ->
+                        // Parse the connection time using the existing time format.
+                        val start = timeFormat.parse(session.connectedAt)
+
+                        // If the session is active, parse the current time using
+                        // the same format so both timestamps use the same reference.
+                        val end = if (session.disconnectedAt == null) {
+                            timeFormat.parse(timeFormat.format(currentTime))
+                        } else {
+                            timeFormat.parse(session.disconnectedAt)
+                        }
+
+                        // Calculate minutes only when both timestamps are valid.
+                        if (start != null && end != null && end.time >= start.time) {
+                            (end.time - start.time) / 60_000L
+                        } else {
+                            0L
+                        }
+                    }
+
+
+                    staff.id to totalMinutes
+                }
+
+                attendanceError = null
+            } catch (e: Exception) {
+                attendanceError =
+                    e.message ?: "Unable to load attendance"
+            } finally {
+                loading = false
+                attendanceLoading = false
+            }
+
+            kotlinx.coroutines.delay(5_000)
+        }
+    }
+
+
+
+    val activeStaff = staffList.count { it.active }
+    val inactiveStaff = staffList.count { !it.active }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(all = 20.dp)
+    )  {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Admin Dashboard",
+                style = MaterialTheme.typography.headlineSmall
+            )
+
+            OutlinedButton(
+                onClick = onLogout
+            ) {
+                Text("Logout")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+            text = "Nethaji Auto Garage",
+            style = MaterialTheme.typography.bodyLarge
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text(
+            text = "Garage Overview",
+            style = MaterialTheme.typography.titleLarge
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (loading) {
+            Text("Loading staff information...")
+        } else {
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    Text("Total Staff")
+                    Text(
+                        text = "${staffList.size}",
+                        style = MaterialTheme.typography.headlineMedium
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Card(
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+                        Text("Active")
+                        Text(
+                            text = "$activeStaff",
+                            style = MaterialTheme.typography.headlineMedium
+                        )
+                    }
+                }
+
+                Card(
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+                        Text("Inactive")
+                        Text(
+                            text = "$inactiveStaff",
+                            style = MaterialTheme.typography.headlineMedium
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text(
+            text = "Today's Attendance",
+            style = MaterialTheme.typography.titleLarge
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+
+        Card(
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp)
+            ) {
+                val attendanceByStaffId =
+                    todayAttendance.associateBy { it.staffId }
+
+                val currentlyWorking = todayAttendance.count {
+                    it.checkInTime != null && it.checkOutTime == null
+                }
+
+                val checkedOut = todayAttendance.count {
+                    it.checkOutTime != null
+                }
+
+                Text(
+                    text = "Attendance Summary",
+                    style = MaterialTheme.typography.titleMedium
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (attendanceLoading) {
+                    Text("Loading attendance...")
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("Checked in")
+                            Text(
+                                text = "${todayAttendance.size}",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                        }
+
+                        Column {
+                            Text("Working")
+                            Text(
+                                text = "$currentlyWorking",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                        }
+
+                        Column {
+                            Text("Checked out")
+                            Text(
+                                text = "$checkedOut",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        text = "Staff Details",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (staffList.isEmpty()) {
+                        Text("No staff members found.")
+                    } else {
+                        staffList.forEach { staff ->
+                            val attendance = attendanceByStaffId[staff.id]
+
+                            val status = when {
+                                attendance == null -> "Not checked in"
+                                attendance.checkOutTime != null -> "Checked out"
+                                attendance.checkInTime != null -> "Currently working"
+                                else -> "Not checked in"
+                            }
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = staff.name,
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+
+                                Text("Status: $status")
+                                Text(
+                                    "Check-in: ${attendance?.checkInTime ?: "—"}"
+                                )
+                                Text(
+                                    "Check-out: ${attendance?.checkOutTime ?: "—"}"
+                                )
+                                val workshopMinutes = attendance?.workshopMinutes ?: 0L
+
+                                Text(
+                                    text = "Time in workshop: ${
+                                        formatWorkshopTime(
+                                            workshopMinutesByStaff[staff.id] ?: 0L
+                                        )
+                                    }"
+                                )
+                            }
+
+                        }
+                    }
+
+                    attendanceError?.let { error ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Attendance error: $error")
+                    }
+                }
+            }
+        }
+
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        OutlinedButton(
+            onClick = onOpenStaffManagement,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("🔧  Staff Management")
+        }
+    }
+}
 /* ============================================================
    STAFF CARD
    ============================================================ */

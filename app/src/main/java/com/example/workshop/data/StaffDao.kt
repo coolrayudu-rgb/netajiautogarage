@@ -32,4 +32,7 @@ interface StaffDao {
 
     @Query("SELECT * FROM staff WHERE id = :id LIMIT 1")
     suspend fun getStaffById(id: Int): Staff?
+
+    @Query("DELETE FROM staff")
+    suspend fun deleteAllStaff()
 }

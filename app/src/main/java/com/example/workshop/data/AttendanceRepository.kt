@@ -24,11 +24,124 @@ class AttendanceRepository(
         date: String
     ): Attendance? {
 
-        return attendanceDao.getAttendance(
-            staffId = staffId,
-            date = date
-        )
+        return try {
+
+            val snapshot =
+                firestore
+                    .collection("attendance")
+                    .document(
+                        documentId(
+                            staffId,
+                            date
+                        )
+                    )
+                    .get()
+                    .await()
+
+            if (snapshot.exists()) {
+
+                val attendance =
+                    Attendance(
+                        id = 0,
+                        staffId =
+                            snapshot.getLong("staffId")
+                                ?.toInt()
+                                ?: staffId,
+                        date =
+                            snapshot.getString("date")
+                                ?: date,
+                        checkInTime =
+                            snapshot.getString(
+                                "checkInTime"
+                            ),
+                        checkOutTime =
+                            snapshot.getString(
+                                "checkOutTime"
+                            ),
+                        totalWorkingMinutes =
+                            snapshot.getLong(
+                                "totalWorkingMinutes"
+                            ) ?: 0L,
+                        workshopMinutes =
+                            snapshot.getLong(
+                                "workshopMinutes"
+                            ) ?: 0L
+                    )
+
+                // Update local Room cache
+                val existing =
+                    attendanceDao.getAttendance(
+                        staffId = staffId,
+                        date = date
+                    )
+
+                if (existing == null) {
+
+                    attendanceDao.insert(
+                        attendance
+                    )
+
+                } else {
+
+                    attendanceDao.update(
+                        attendance.copy(
+                            id = existing.id
+                        )
+                    )
+                }
+
+                attendance
+
+            } else {
+
+                attendanceDao.getAttendance(
+                    staffId = staffId,
+                    date = date
+                )
+            }
+
+        } catch (e: Exception) {
+
+            // Firebase unavailable → use Room
+            attendanceDao.getAttendance(
+                staffId = staffId,
+                date = date
+            )
+        }
     }
+
+    suspend fun getAllTodayAttendance(
+        date: String
+    ): List<Attendance> {
+
+        return try {
+            val snapshot = firestore
+                .collection("attendance")
+                .whereEqualTo("date", date)
+                .get()
+                .await()
+
+            snapshot.documents.mapNotNull { document ->
+                val staffId = document.getLong("staffId")?.toInt()
+                    ?: return@mapNotNull null
+
+                Attendance(
+                    id = 0,
+                    staffId = staffId,
+                    date = document.getString("date") ?: date,
+                    checkInTime = document.getString("checkInTime"),
+                    checkOutTime = document.getString("checkOutTime"),
+                    totalWorkingMinutes =
+                        document.getLong("totalWorkingMinutes") ?: 0L,
+                    workshopMinutes =
+                        document.getLong("workshopMinutes") ?: 0L
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
 
     suspend fun checkIn(
         staffId: Int,
@@ -152,14 +265,15 @@ class AttendanceRepository(
             .await()
     }
 
-    private suspend fun com.google.android.gms.tasks.Task<Void>.await() {
+    private suspend fun <T>
+            com.google.android.gms.tasks.Task<T>.await(): T {
 
-        suspendCancellableCoroutine { continuation ->
+        return suspendCancellableCoroutine { continuation ->
 
-            addOnSuccessListener {
+            addOnSuccessListener { result ->
 
                 if (continuation.isActive) {
-                    continuation.resume(Unit)
+                    continuation.resume(result)
                 }
             }
 
