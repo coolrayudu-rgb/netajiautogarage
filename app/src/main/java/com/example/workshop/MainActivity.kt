@@ -1,12 +1,6 @@
 package com.example.workshop
 
 import android.Manifest
-import android.content.Context
-import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
-import android.net.wifi.WifiInfo
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.BackHandler
@@ -15,12 +9,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -45,14 +42,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
-import androidx.core.app.NotificationCompat
 import androidx.lifecycle.lifecycleScope
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import com.example.workshop.data.AdminRepository
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -60,11 +50,26 @@ import com.example.workshop.data.Staff
 import com.example.workshop.data.StaffRepository
 import com.example.workshop.data.Attendance
 import com.example.workshop.data.AttendanceRepository
+import com.example.workshop.data.ChecklistRepository
+import com.example.workshop.data.WorkshopSettingsRepository
+import com.example.workshop.data.WorkshopTime
 import com.example.workshop.data.WorkshopWifiSessionRepository
 import com.example.workshop.data.WorkshopDatabase
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private const val ALLOWED_WIFI = "TP-Link_0E14"
+/*
+ * The daily workshop checklist shown to staff.
+ */
+val WORKSHOP_CHECKLIST = listOf(
+    "Shed Opened",
+    "Cleaning",
+    "Sorted Bikes",
+    "Sorted Wrenches",
+    "Engine Assembled",
+    "Bore Assembled",
+    "Engine Disassembled"
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -76,12 +81,10 @@ class MainActivity : ComponentActivity() {
 
     lateinit var workshopWifiSessionRepository: WorkshopWifiSessionRepository
 
-    private var wifiPermissionGranted = false
+    lateinit var settingsRepository: WorkshopSettingsRepository
 
-    /*
-     * IMPORTANT:
-     * Your AdminViewModelFactory accepts ONLY AdminRepository.
-     */
+    lateinit var checklistRepository: ChecklistRepository
+
     private val adminViewModel: AdminViewModel by viewModels {
         AdminViewModelFactory(adminRepository)
     }
@@ -101,29 +104,20 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) {
-            wifiPermissionGranted = checkWifiPermissions()
-            refreshWifi()
-        }
-
-    private val notificationPermissionLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            android.util.Log.d(
-                "GARAGE_NOTIFICATION",
-                "Notification permission granted: $granted"
-            )
-
-            if (granted) {
-                showTestNotification()
+            lifecycleScope.launch {
+                WorkshopTracker.runCycle(
+                    this@MainActivity,
+                    forceWifiCheck = true
+                )
             }
+            WorkshopTrackingService.sync(this)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         FirebaseApp.initializeApp(this)
-        createNotificationChannel()
+        Notifier.createChannels(this)
 
         FirebaseMessaging.getInstance().token
             .addOnCompleteListener { task ->
@@ -136,10 +130,9 @@ class MainActivity : ComponentActivity() {
                     return@addOnCompleteListener
                 }
 
-                val token = task.result
                 android.util.Log.d(
                     "GARAGE_FCM",
-                    "FCM registration token: $token"
+                    "FCM registration token: ${task.result}"
                 )
             }
 
@@ -156,16 +149,19 @@ class MainActivity : ComponentActivity() {
         attendanceRepository = AttendanceRepository(
             database.attendanceDao()
         )
+
         workshopWifiSessionRepository =
             WorkshopWifiSessionRepository(
                 database.workshopWifiSessionDao()
             )
 
-        wifiPermissionGranted = checkWifiPermissions()
+        settingsRepository = WorkshopSettingsRepository(this)
 
-        if (!wifiPermissionGranted) {
-            requestWifiPermissions()
-        }
+        checklistRepository = ChecklistRepository(
+            database.checklistDao()
+        )
+
+        requestPermissionsIfNeeded()
 
         setContent {
             MaterialTheme {
@@ -180,234 +176,70 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "garage_notifications",
-                "Garage Notifications",
-                NotificationManager.IMPORTANCE_DEFAULT
-            ).apply {
-                description = "Staff check-ins and workshop alerts"
-            }
-
-            val manager = getSystemService(
-                NotificationManager::class.java
-            )
-
-            manager.createNotificationChannel(channel)
-        }
+    override fun onResume() {
+        super.onResume()
+        // Start background tracking if someone is logged in.
+        WorkshopTrackingService.sync(this)
     }
 
-    private fun showTestNotification() {
-        val notification = NotificationCompat.Builder(
-            this,
-            "garage_notifications"
-        )
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("Nethaji Auto Garage")
-            .setContentText("Test notification is working!")
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setAutoCancel(true)
-            .build()
+    /*
+     * Wi-Fi name needs location (and nearby Wi-Fi on
+     * Android 13+). Alerts need notification permission
+     * on Android 13+.
+     */
+    fun requestPermissionsIfNeeded() {
 
-        val manager = getSystemService(
-            Context.NOTIFICATION_SERVICE
-        ) as NotificationManager
+        val needed = mutableListOf<String>()
 
-        manager.notify(1001, notification)
-    }
+        if (!WifiChecker.hasPermission(this)) {
+            // Android 12+ ignores a fine-location request
+            // that doesn't include coarse location too.
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
+            needed += Manifest.permission.ACCESS_COARSE_LOCATION
 
-    fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (!granted) {
-                notificationPermissionLauncher.launch(
-                    Manifest.permission.POST_NOTIFICATIONS
-                )
-                return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                needed += Manifest.permission.NEARBY_WIFI_DEVICES
             }
         }
 
-        showTestNotification()
-    }
-
-    private fun checkWifiPermissions(): Boolean {
-
-        val locationPermission =
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-
-            val nearbyWifiPermission =
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.NEARBY_WIFI_DEVICES
-                ) == PackageManager.PERMISSION_GRANTED
-
-            return locationPermission || nearbyWifiPermission
-        }
-
-        return locationPermission
-    }
-
-    private fun requestWifiPermissions() {
-
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(
-                Manifest.permission.NEARBY_WIFI_DEVICES
-            )
-        }
-
-        permissionLauncher.launch(
-            permissions.toTypedArray()
-        )
-    }
-
-    fun refreshWifi() {
-        wifiPermissionGranted = checkWifiPermissions()
-    }
-
-    fun checkWorkshopWifi(): Boolean {
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "========== WIFI CHECK START =========="
-        )
-
-        if (!wifiPermissionGranted) {
-
-            android.util.Log.e(
-                "WIFI_TEST",
-                "Permission = FALSE"
-            )
-
-            return false
-        }
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "Permission = OK"
-        )
-
-        val connectivityManager =
-            getSystemService(Context.CONNECTIVITY_SERVICE)
-                    as ConnectivityManager
-
-        val network =
-            connectivityManager.activeNetwork
-
-        if (network == null) {
-
-            android.util.Log.e(
-                "WIFI_TEST",
-                "Active network = NULL"
-            )
-
-            return false
-        }
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "Active network = $network"
-        )
-
-        val capabilities =
-            connectivityManager.getNetworkCapabilities(network)
-
-        if (capabilities == null) {
-
-            android.util.Log.e(
-                "WIFI_TEST",
-                "Network capabilities = NULL"
-            )
-
-            return false
-        }
-
-        val isWifi =
-            capabilities.hasTransport(
-                NetworkCapabilities.TRANSPORT_WIFI
-            )
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "WiFi transport = $isWifi"
-        )
-
-        if (!isWifi) {
-            return false
-        }
-
-        /*
-         * First try NetworkCapabilities transportInfo.
-         * This is more reliable on newer Android versions.
-         */
-        var currentSsid: String? = null
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-
-            val wifiInfo =
-                capabilities.transportInfo as? WifiInfo
-
-            if (wifiInfo != null) {
-                currentSsid = wifiInfo.ssid
-            }
-        }
-
-        /*
-         * Fallback to WifiManager.
-         */
         if (
-            currentSsid.isNullOrBlank() ||
-            currentSsid == "<unknown ssid>"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !Notifier.canNotify(this)
         ) {
-
-            val wifiManager =
-                applicationContext.getSystemService(
-                    Context.WIFI_SERVICE
-                ) as WifiManager
-
-            val wifiInfo =
-                wifiManager.connectionInfo
-
-            currentSsid = wifiInfo.ssid
+            needed += Manifest.permission.POST_NOTIFICATIONS
         }
 
-        currentSsid =
-            currentSsid
-                ?.removePrefix("\"")
-                ?.removeSuffix("\"")
+        if (needed.isNotEmpty()) {
+            permissionLauncher.launch(needed.toTypedArray())
+        }
+    }
+}
 
-        android.util.Log.e(
-            "WIFI_TEST",
-            "SSID detected = [$currentSsid]"
+/* ============================================================
+   SHARED LAYOUT
+   ============================================================ */
+
+/*
+ * A screen that is centred when it fits and scrolls
+ * when it doesn't (small phones, keyboard open).
+ */
+@Composable
+fun CenteredScrollColumn(
+    content: @Composable ColumnScope.() -> Unit
+) {
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .heightIn(min = maxHeight)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            content = content
         )
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "SSID expected = [$ALLOWED_WIFI]"
-        )
-
-        val result =
-            currentSsid == ALLOWED_WIFI
-
-        android.util.Log.e(
-            "WIFI_TEST",
-            "FINAL RESULT = $result"
-        )
-
-        return result
     }
 }
 
@@ -424,27 +256,38 @@ fun WorkshopApp(
     workshopWifiSessionViewModel: WorkshopWifiSessionViewModel
 ) {
 
-    var wifiConnected by remember {
-        mutableStateOf(activity.checkWorkshopWifi())
-    }
+    val scope = rememberCoroutineScope()
 
+    val wifiConnected by
+    WorkshopTracker.wifiConnected.collectAsState()
+
+    val requiredWifiName by
+    WorkshopTracker.requiredWifiName.collectAsState()
+
+    /*
+     * A staff login is remembered on the phone so that
+     * tracking keeps going in the background and after
+     * the app is reopened.
+     */
     var loggedInStaff by remember {
-        mutableStateOf<Staff?>(null)
-    }
-
-    val sessionPrefs = remember {
-        activity.getSharedPreferences(
-            "garage_session",
-            Context.MODE_PRIVATE
+        mutableStateOf(
+            WorkshopTracker.loggedInStaffId(activity)?.let { id ->
+                Staff(
+                    id = id,
+                    name = WorkshopTracker.loggedInStaffName(activity),
+                    username = "",
+                    password = ""
+                )
+            }
         )
     }
 
     var screen by remember {
         mutableStateOf(
-            if (sessionPrefs.getBoolean("admin_logged_in", false)) {
-                "adminDashboard"
-            } else {
-                "home"
+            when {
+                WorkshopTracker.isAdminLoggedIn(activity) -> "adminDashboard"
+                loggedInStaff != null -> "staffHome"
+                else -> "home"
             }
         )
     }
@@ -460,32 +303,30 @@ fun WorkshopApp(
         }
     }
 
-    val attendance by
-    attendanceViewModel.todayAttendance.collectAsState()
-
-    /*
- * Check Wi-Fi when the application starts.
- */
-    LaunchedEffect(Unit) {
-        wifiConnected = activity.checkWorkshopWifi()
+    fun refreshNow() {
+        scope.launch {
+            WorkshopTracker.runCycle(activity, forceWifiCheck = true)
+            loggedInStaff?.let {
+                attendanceViewModel.loadTodayAttendance(it.id)
+            }
+        }
     }
 
     /*
-     * Check Wi-Fi every 30 minutes while
-     * the staff dashboard is open.
+     * Check Wi-Fi when the app opens. Then, if background
+     * tracking couldn't start (for example, a permission
+     * was refused), keep tracking while the app is open:
+     * every minute, with the Wi-Fi checked every 5 minutes.
      */
-    LaunchedEffect(screen) {
+    LaunchedEffect(Unit) {
 
-        if (screen == "staffHome") {
+        WorkshopTracker.runCycle(activity, forceWifiCheck = true)
 
-            while (true) {
+        while (true) {
+            delay(60_000L)
 
-                wifiConnected =
-                    activity.checkWorkshopWifi()
-
-                kotlinx.coroutines.delay(
-                    30 * 60 * 1000L
-                )
+            if (!WorkshopTrackingService.isRunning) {
+                WorkshopTracker.runCycle(activity)
             }
         }
     }
@@ -498,27 +339,23 @@ fun WorkshopApp(
                 wifiConnected = wifiConnected,
 
                 onRefreshWifi = {
-                    activity.refreshWifi()
-                    wifiConnected =
-                        activity.checkWorkshopWifi()
+                    activity.requestPermissionsIfNeeded()
+                    refreshNow()
                 },
 
                 onAdminLogin = {
-                    screen = if (
-                        sessionPrefs.getBoolean("admin_logged_in", false)
-                    ) {
-                        "adminDashboard"
-                    } else {
-                        "adminLogin"
-                    }
+                    screen =
+                        if (WorkshopTracker.isAdminLoggedIn(activity)) {
+                            "adminDashboard"
+                        } else {
+                            "adminLogin"
+                        }
                 },
 
                 onStaffLogin = {
-                    screen = "staffLogin"
-                },
-                onTestNotification = {
-                    activity.requestNotificationPermission()
-                },
+                    screen =
+                        if (loggedInStaff != null) "staffHome" else "staffLogin"
+                }
             )
         }
 
@@ -532,10 +369,8 @@ fun WorkshopApp(
                 },
 
                 onSuccess = {
-                    sessionPrefs.edit()
-                        .putBoolean("admin_logged_in", true)
-                        .apply()
-
+                    WorkshopTracker.setAdminLoggedIn(activity, true)
+                    WorkshopTrackingService.sync(activity)
                     screen = "adminDashboard"
                 }
             )
@@ -552,6 +387,9 @@ fun WorkshopApp(
 
                 onLoginSuccess = { staff ->
                     loggedInStaff = staff
+                    WorkshopTracker.setStaffLoggedIn(activity, staff.id, staff.name)
+                    WorkshopTrackingService.sync(activity)
+                    refreshNow()
                     screen = "staffHome"
                 }
             )
@@ -559,53 +397,31 @@ fun WorkshopApp(
 
         "staffHome" -> {
 
-            loggedInStaff?.let { staff ->
+            val staff = loggedInStaff
 
-                LaunchedEffect(
-                    wifiConnected,
-                    staff.id,
-                    attendance?.checkInTime,
-                    attendance?.checkOutTime
-                ) {
-
-                    // Only track workshop Wi-Fi time
-                    // after the employee has checked in.
-                    if (
-                        attendance?.checkInTime != null &&
-                        attendance?.checkOutTime == null
-                    ) {
-
-                        if (wifiConnected) {
-
-                            workshopWifiSessionViewModel
-                                .startSession(staff.id)
-
-                        } else {
-
-                            workshopWifiSessionViewModel
-                                .endSession(staff.id)
-                        }
-                    }
-                }
+            if (staff == null) {
+                LaunchedEffect(Unit) { screen = "home" }
+            } else {
 
                 StaffHomeScreen(
                     staff = staff,
                     attendanceViewModel = attendanceViewModel,
                     workshopWifiSessionViewModel =
                         workshopWifiSessionViewModel,
+                    checklistRepository = activity.checklistRepository,
                     wifiConnected = wifiConnected,
-                    onRefreshWifi = {
-                        wifiConnected =
-                            activity.checkWorkshopWifi()
-                    },
+                    onRefreshWifi = { refreshNow() },
+                    onAttendanceChanged = { refreshNow() },
                     onLogout = {
                         loggedInStaff = null
+                        WorkshopTracker.setStaffLoggedIn(activity, null)
+                        attendanceViewModel.clear()
+                        WorkshopTrackingService.sync(activity)
                         screen = "home"
                     }
                 )
             }
         }
-
 
         "adminDashboard" -> {
             AdminDashboardScreen(
@@ -613,14 +429,22 @@ fun WorkshopApp(
                 attendanceRepository = activity.attendanceRepository,
                 workshopWifiSessionRepository =
                     activity.workshopWifiSessionRepository,
+                settingsRepository = activity.settingsRepository,
+                checklistRepository = activity.checklistRepository,
+                requiredWifiName = requiredWifiName,
+                currentWifiName = {
+                    WifiChecker.currentSsid(activity)
+                },
+                onWifiNameSaved = { name ->
+                    WorkshopTracker.setRequiredWifiName(name)
+                    refreshNow()
+                },
                 onOpenStaffManagement = {
                     screen = "staffManagement"
                 },
                 onLogout = {
-                    sessionPrefs.edit()
-                        .remove("admin_logged_in")
-                        .apply()
-
+                    WorkshopTracker.setAdminLoggedIn(activity, false)
+                    WorkshopTrackingService.sync(activity)
                     screen = "home"
                 }
             )
@@ -634,7 +458,6 @@ fun WorkshopApp(
                 }
             )
         }
-
     }
 }
 
@@ -647,17 +470,10 @@ fun HomeScreen(
     wifiConnected: Boolean,
     onRefreshWifi: () -> Unit,
     onAdminLogin: () -> Unit,
-    onStaffLogin: () -> Unit,
-    onTestNotification: () -> Unit
+    onStaffLogin: () -> Unit
 ) {
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    CenteredScrollColumn {
 
         Text(
             text = "Nethaji Auto Garage",
@@ -735,17 +551,6 @@ fun HomeScreen(
         ) {
             Text("Refresh Wi-Fi Status")
         }
-
-        Spacer(
-            modifier = Modifier.height(12.dp)
-        )
-
-        OutlinedButton(
-            onClick = onTestNotification,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Test Notification")
-        }
     }
 }
 
@@ -783,13 +588,7 @@ fun AdminLoginScreen(
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    CenteredScrollColumn {
 
         Text(
             text = "Admin Login",
@@ -922,13 +721,7 @@ fun StaffLoginScreen(
 
     val scope = rememberCoroutineScope()
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    CenteredScrollColumn {
 
         Text(
             text = "Staff Login",
@@ -1294,11 +1087,29 @@ fun StaffManagementScreen(
 }
 
 
+/* ============================================================
+   ADMIN DASHBOARD
+   ============================================================ */
+
+/*
+ * What the dashboard shows for one staff member today.
+ */
+data class StaffDayStatus(
+    val workshopMinutes: Long,
+    val awaySince: String?,
+    val checklistDone: Int
+)
+
 @Composable
 fun AdminDashboardScreen(
     staffRepository: StaffRepository,
     attendanceRepository: AttendanceRepository,
     workshopWifiSessionRepository: WorkshopWifiSessionRepository,
+    settingsRepository: WorkshopSettingsRepository,
+    checklistRepository: ChecklistRepository,
+    requiredWifiName: String,
+    currentWifiName: () -> String?,
+    onWifiNameSaved: (String) -> Unit,
     onOpenStaffManagement: () -> Unit,
     onLogout: () -> Unit
 ) {
@@ -1311,15 +1122,12 @@ fun AdminDashboardScreen(
         mutableStateOf(true)
     }
 
-    val scope = rememberCoroutineScope()
-
-
     var todayAttendance by remember {
         mutableStateOf<List<Attendance>>(emptyList())
     }
 
-    var workshopMinutesByStaff by remember {
-        mutableStateOf<Map<Int, Long>>(emptyMap())
+    var statusByStaff by remember {
+        mutableStateOf<Map<Int, StaffDayStatus>>(emptyMap())
     }
 
     var attendanceLoading by remember {
@@ -1330,63 +1138,45 @@ fun AdminDashboardScreen(
         mutableStateOf<String?>(null)
     }
 
-
-    fun formatWorkshopTime(minutes: Long): String {
-        val hours = minutes / 60
-        val remainingMinutes = minutes % 60
-        return "${hours}h ${remainingMinutes}m"
-    }
-
-
-
     LaunchedEffect(Unit) {
         while (true) {
             try {
                 staffList = staffRepository.getAllStaff()
 
-                val today = java.text.SimpleDateFormat(
-                    "yyyy-MM-dd",
-                    java.util.Locale.getDefault()
-                ).format(java.util.Date())
+                val today = WorkshopTime.today()
 
                 todayAttendance =
                     attendanceRepository.getAllTodayAttendance(today)
 
-                val currentTime = java.util.Date()
-                val timeFormat = java.text.SimpleDateFormat(
-                    "hh:mm a",
-                    java.util.Locale.getDefault()
-                )
+                val attendanceByStaffId =
+                    todayAttendance.associateBy { it.staffId }
 
-                workshopMinutesByStaff = staffList.associate { staff ->
-                    val sessions = workshopWifiSessionRepository.getSessionsForDate(
-                        staffId = staff.id,
-                        date = today
+                statusByStaff = staffList.associate { staff ->
+
+                    val attendance = attendanceByStaffId[staff.id]
+
+                    // A shift that started yesterday keeps
+                    // yesterday's date for its sessions.
+                    val shiftDate = attendance?.date ?: today
+
+                    val sessions =
+                        workshopWifiSessionRepository.getSessionsForDate(
+                            staffId = staff.id,
+                            date = shiftDate
+                        )
+
+                    val checklist =
+                        checklistRepository.getChecklist(staff.id, shiftDate)
+
+                    staff.id to StaffDayStatus(
+                        // Sum of all of the shift's Wi-Fi sessions.
+                        workshopMinutes =
+                            WorkshopTracker.workshopMinutes(sessions, shiftDate),
+                        awaySince =
+                            WorkshopTracker.awaySince(attendance, sessions),
+                        checklistDone =
+                            WORKSHOP_CHECKLIST.count { checklist[it] == true }
                     )
-
-
-                    val totalMinutes = sessions.sumOf { session ->
-                        // Parse the connection time using the existing time format.
-                        val start = timeFormat.parse(session.connectedAt)
-
-                        // If the session is active, parse the current time using
-                        // the same format so both timestamps use the same reference.
-                        val end = if (session.disconnectedAt == null) {
-                            timeFormat.parse(timeFormat.format(currentTime))
-                        } else {
-                            timeFormat.parse(session.disconnectedAt)
-                        }
-
-                        // Calculate minutes only when both timestamps are valid.
-                        if (start != null && end != null && end.time >= start.time) {
-                            (end.time - start.time) / 60_000L
-                        } else {
-                            0L
-                        }
-                    }
-
-
-                    staff.id to totalMinutes
                 }
 
                 attendanceError = null
@@ -1398,11 +1188,9 @@ fun AdminDashboardScreen(
                 attendanceLoading = false
             }
 
-            kotlinx.coroutines.delay(5_000)
+            delay(5_000)
         }
     }
-
-
 
     val activeStaff = staffList.count { it.active }
     val inactiveStaff = staffList.count { !it.active }
@@ -1412,7 +1200,7 @@ fun AdminDashboardScreen(
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(all = 20.dp)
-    )  {
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1508,7 +1296,6 @@ fun AdminDashboardScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-
         Card(
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -1525,6 +1312,8 @@ fun AdminDashboardScreen(
                 val checkedOut = todayAttendance.count {
                     it.checkOutTime != null
                 }
+
+                val awayNow = statusByStaff.values.count { it.awaySince != null }
 
                 Text(
                     text = "Attendance Summary",
@@ -1557,6 +1346,14 @@ fun AdminDashboardScreen(
                         }
 
                         Column {
+                            Text("Away")
+                            Text(
+                                text = "$awayNow",
+                                style = MaterialTheme.typography.headlineSmall
+                            )
+                        }
+
+                        Column {
                             Text("Checked out")
                             Text(
                                 text = "$checkedOut",
@@ -1579,10 +1376,20 @@ fun AdminDashboardScreen(
                     } else {
                         staffList.forEach { staff ->
                             val attendance = attendanceByStaffId[staff.id]
+                            val dayStatus = statusByStaff[staff.id]
 
                             val status = when {
                                 attendance == null -> "Not checked in"
                                 attendance.checkOutTime != null -> "Checked out"
+                                dayStatus?.awaySince != null ->
+                                    "Away from workshop for " +
+                                            WorkshopTime.formatMinutes(
+                                                WorkshopTime.minutesBetween(
+                                                    dayStatus.awaySince,
+                                                    null,
+                                                    attendance.date
+                                                )
+                                            )
                                 attendance.checkInTime != null -> "Currently working"
                                 else -> "Not checked in"
                             }
@@ -1599,22 +1406,39 @@ fun AdminDashboardScreen(
 
                                 Text("Status: $status")
                                 Text(
-                                    "Check-in: ${attendance?.checkInTime ?: "—"}"
-                                )
-                                Text(
-                                    "Check-out: ${attendance?.checkOutTime ?: "—"}"
-                                )
-                                val workshopMinutes = attendance?.workshopMinutes ?: 0L
-
-                                Text(
-                                    text = "Time in workshop: ${
-                                        formatWorkshopTime(
-                                            workshopMinutesByStaff[staff.id] ?: 0L
+                                    "Check-in: ${
+                                        WorkshopTime.display(
+                                            attendance?.checkInTime,
+                                            attendance?.date
                                         )
                                     }"
                                 )
+                                Text(
+                                    "Check-out: ${
+                                        WorkshopTime.display(
+                                            attendance?.checkOutTime,
+                                            attendance?.date
+                                        )
+                                    }"
+                                )
+                                Text(
+                                    "Total working time: ${
+                                        WorkshopTime.formatMinutes(
+                                            WorkshopTracker.totalWorkingMinutes(attendance)
+                                        )
+                                    }"
+                                )
+                                Text(
+                                    "Time in workshop: ${
+                                        WorkshopTime.formatMinutes(
+                                            dayStatus?.workshopMinutes ?: 0L
+                                        )
+                                    }"
+                                )
+                                Text(
+                                    "Checklist: ${dayStatus?.checklistDone ?: 0} of ${WORKSHOP_CHECKLIST.size} done"
+                                )
                             }
-
                         }
                     }
 
@@ -1626,6 +1450,14 @@ fun AdminDashboardScreen(
             }
         }
 
+        Spacer(modifier = Modifier.height(24.dp))
+
+        WorkshopWifiSettingsCard(
+            settingsRepository = settingsRepository,
+            requiredWifiName = requiredWifiName,
+            currentWifiName = currentWifiName,
+            onSaved = onWifiNameSaved
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -1637,6 +1469,119 @@ fun AdminDashboardScreen(
         }
     }
 }
+
+/* ============================================================
+   WORKSHOP WI-FI SETTING (ADMIN)
+   ============================================================ */
+
+@Composable
+fun WorkshopWifiSettingsCard(
+    settingsRepository: WorkshopSettingsRepository,
+    requiredWifiName: String,
+    currentWifiName: () -> String?,
+    onSaved: (String) -> Unit
+) {
+
+    var newName by remember(requiredWifiName) {
+        mutableStateOf(requiredWifiName)
+    }
+
+    var message by remember {
+        mutableStateOf("")
+    }
+
+    var saving by remember {
+        mutableStateOf(false)
+    }
+
+    val scope = rememberCoroutineScope()
+
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Text(
+                text = "Workshop Wi-Fi",
+                style = MaterialTheme.typography.titleMedium
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text("Staff must be on this Wi-Fi to check in and out.")
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = "Current: $requiredWifiName",
+                style = MaterialTheme.typography.bodyMedium
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedTextField(
+                value = newName,
+                onValueChange = {
+                    newName = it
+                    message = ""
+                },
+                label = {
+                    Text("Wi-Fi name")
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = {
+                    val ssid = currentWifiName()
+                    if (ssid != null) {
+                        newName = ssid
+                        message = ""
+                    } else {
+                        message =
+                            "Can't read this phone's Wi-Fi name. Connect to Wi-Fi and allow location."
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Use this phone's current Wi-Fi")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                enabled = !saving && newName.isNotBlank() && newName.trim() != requiredWifiName,
+                onClick = {
+                    saving = true
+                    scope.launch {
+                        message =
+                            try {
+                                settingsRepository.saveWifiName(newName)
+                                onSaved(newName.trim())
+                                "Saved. All phones will use \"${newName.trim()}\"."
+                            } catch (e: Exception) {
+                                "Couldn't save: ${e.message ?: "no connection"}"
+                            }
+                        saving = false
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (saving) "Saving..." else "Save Wi-Fi Name")
+            }
+
+            if (message.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(message)
+            }
+        }
+    }
+}
+
 /* ============================================================
    STAFF CARD
    ============================================================ */
@@ -1962,8 +1907,9 @@ fun EditStaffDialog(
         }
     )
 }
+
 /* ============================================================
-   ADD StaffHomeScreen
+   STAFF DASHBOARD
    ============================================================ */
 
 @Composable
@@ -1972,8 +1918,10 @@ fun StaffHomeScreen(
     attendanceViewModel: AttendanceViewModel,
     workshopWifiSessionViewModel:
     WorkshopWifiSessionViewModel,
+    checklistRepository: ChecklistRepository,
     wifiConnected: Boolean,
     onRefreshWifi: () -> Unit,
+    onAttendanceChanged: () -> Unit,
     onLogout: () -> Unit
 ) {
 
@@ -1983,124 +1931,72 @@ fun StaffHomeScreen(
     var totalWorkingMinutes by remember {
         mutableStateOf(0L)
     }
+
     var workshopMinutes by remember {
         mutableStateOf(0L)
     }
 
+    var awaySince by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    // The checklist belongs to the shift's day.
+    val checklistDate = attendance?.date ?: WorkshopTime.today()
+
+    var checklist by remember(staff.id, checklistDate) {
+        mutableStateOf<Map<String, Boolean>>(emptyMap())
+    }
+
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(staff.id) {
+        attendanceViewModel.loadTodayAttendance(staff.id)
+    }
+
+    LaunchedEffect(staff.id, checklistDate) {
+        checklist = checklistRepository.getChecklist(staff.id, checklistDate)
+    }
+
+    /*
+     * Refresh the times on screen every minute.
+     * (Saving them to Firebase is done by WorkshopTracker,
+     * also in the background.)
+     */
     LaunchedEffect(
         staff.id,
         wifiConnected,
-        attendance?.checkInTime
+        attendance?.checkInTime,
+        attendance?.checkOutTime
     ) {
 
         while (true) {
 
-            val now = Date()
+            val current = attendance
 
-            // -----------------------------
-            // TOTAL WORKING HOURS
-            // -----------------------------
+            totalWorkingMinutes =
+                WorkshopTracker.totalWorkingMinutes(current)
 
-            val checkIn =
-                parseWorkshopTime(
-                    attendance?.checkInTime
-                )
+            if (current != null) {
 
-            val checkOut =
-                parseWorkshopTime(
-                    attendance?.checkOutTime
-                )
+                val sessions =
+                    workshopWifiSessionViewModel.getShiftSessions(
+                        staffId = staff.id,
+                        shiftDate = current.date
+                    )
 
-            val workingEnd =
-                checkOut ?: now
+                // Sum of all of the shift's Wi-Fi sessions.
+                workshopMinutes =
+                    WorkshopTracker.workshopMinutes(sessions, current.date)
 
-            if (checkIn != null) {
-
-                val minutes =
-                    (
-                            workingEnd.time -
-                                    checkIn.time
-                            ) / 60000L
-
-                totalWorkingMinutes =
-                    minutes.coerceAtLeast(0L)
+                awaySince =
+                    WorkshopTracker.awaySince(current, sessions)
+            } else {
+                workshopMinutes = 0L
+                awaySince = null
             }
 
-
-            // -----------------------------
-            // TIME SPENT IN WORKSHOP
-            // -----------------------------
-
-            val sessions =
-                workshopWifiSessionViewModel
-                    .getTodaySessions(staff.id)
-
-            workshopMinutes =
-                sessions.sumOf { session ->
-
-                    val start =
-                        parseWorkshopTime(
-                            session.connectedAt
-                        )
-
-                    val end =
-                        parseWorkshopTime(
-                            session.disconnectedAt
-                        ) ?: if (
-                            wifiConnected &&
-                            start != null
-                        ) {
-                            now
-                        } else {
-                            null
-                        }
-
-                    if (
-                        start != null &&
-                        end != null
-                    ) {
-
-                        (
-                                end.time -
-                                        start.time
-                                ) / 60000L
-
-                    } else {
-                        0L
-                    }
-                }
-
-
-// -----------------------------
-// UPDATE FIRESTORE LIVE
-// -----------------------------
-
-            val currentAttendance = attendance
-
-            if (
-                currentAttendance != null &&
-                currentAttendance.checkInTime != null &&
-                currentAttendance.checkOutTime == null
-            ) {
-
-                attendanceViewModel.updateLiveTimes(
-                    attendance = currentAttendance,
-                    totalWorkingMinutes =
-                        totalWorkingMinutes,
-                    workshopMinutes =
-                        workshopMinutes
-                )
-            }
-
-
-            kotlinx.coroutines.delay(
-                60_000L
-            )
+            delay(60_000L)
         }
-    }
-
-    LaunchedEffect(staff.id) {
-        attendanceViewModel.loadTodayAttendance(staff.id)
     }
 
     Column(
@@ -2159,6 +2055,14 @@ fun StaffHomeScreen(
                 MaterialTheme.typography.bodyLarge
         )
 
+        awaySince?.let { since ->
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Away from the workshop since ${WorkshopTime.display(since, attendance?.date)}",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        }
+
         Spacer(
             modifier = Modifier.height(8.dp)
         )
@@ -2187,33 +2091,23 @@ fun StaffHomeScreen(
             modifier = Modifier.height(16.dp)
         )
 
-        /*
-         * CHECK IN
-         */
         if (attendance?.checkInTime == null) {
 
+            /*
+             * CHECK IN
+             */
             Button(
                 onClick = {
-
-                    /*
-                     * Wi-Fi is checked again immediately
-                     * before allowing Check In.
-                     */
                     if (wifiConnected) {
-
                         attendanceViewModel.checkIn(
-                            staff.id
-                        )
-
-                        workshopWifiSessionViewModel.startSession(
-                            staff.id
+                            staff.id,
+                            onDone = onAttendanceChanged
                         )
                     }
                 },
                 enabled = wifiConnected,
                 modifier = Modifier.fillMaxWidth()
             ) {
-
                 Text(
                     if (wifiConnected) {
                         "CHECK IN"
@@ -2230,7 +2124,12 @@ fun StaffHomeScreen(
              */
             Text(
                 text =
-                    "Checked In — ${attendance?.checkInTime}",
+                    "Checked In — ${
+                        WorkshopTime.display(
+                            attendance?.checkInTime,
+                            attendance?.date
+                        )
+                    }",
                 style =
                     MaterialTheme.typography.titleMedium
             )
@@ -2239,33 +2138,23 @@ fun StaffHomeScreen(
                 modifier = Modifier.height(16.dp)
             )
 
-            /*
-             * CHECK OUT
-             */
             if (attendance?.checkOutTime == null) {
 
+                /*
+                 * CHECK OUT (Wi-Fi must still be connected)
+                 */
                 Button(
                     onClick = {
-
-                        /*
-                         * Wi-Fi must still be connected
-                         * to check out.
-                         */
                         if (wifiConnected) {
-
                             attendanceViewModel.checkOut(
-                                staff.id
-                            )
-
-                            workshopWifiSessionViewModel.endSession(
-                                staff.id
+                                staff.id,
+                                onDone = onAttendanceChanged
                             )
                         }
                     },
                     enabled = wifiConnected,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-
                     Text(
                         if (wifiConnected) {
                             "CHECK OUT"
@@ -2282,7 +2171,12 @@ fun StaffHomeScreen(
                  */
                 Text(
                     text =
-                        "Checked Out — ${attendance?.checkOutTime}",
+                        "Checked Out — ${
+                            WorkshopTime.display(
+                                attendance?.checkOutTime,
+                                attendance?.date
+                            )
+                        }",
                     style =
                         MaterialTheme.typography.titleMedium
                 )
@@ -2307,9 +2201,7 @@ fun StaffHomeScreen(
         )
 
         Text(
-            text = formatMinutes(
-                totalWorkingMinutes
-            ),
+            text = formatMinutes(totalWorkingMinutes),
             style =
                 MaterialTheme.typography.headlineSmall
         )
@@ -2320,6 +2212,7 @@ fun StaffHomeScreen(
 
         /*
          * TIME SPENT IN WORKSHOP
+         * (sum of all of today's workshop Wi-Fi sessions)
          */
         Text(
             text = "Time Spent in Workshop",
@@ -2342,7 +2235,7 @@ fun StaffHomeScreen(
         )
 
         /*
-         * WORK CHECKLIST
+         * WORK CHECKLIST (saved on the phone and in Firebase)
          */
         Text(
             text = "Today's Work Checklist",
@@ -2354,36 +2247,50 @@ fun StaffHomeScreen(
             modifier = Modifier.height(12.dp)
         )
 
-        ChecklistItem("Shed Opened")
-        ChecklistItem("Cleaning")
-        ChecklistItem("Sorted Bikes")
-        ChecklistItem("Sorted Wrenches")
-        ChecklistItem("Engine Assembled")
-        ChecklistItem("Bore Assembled")
-        ChecklistItem("Engine Disassembled")
+        WORKSHOP_CHECKLIST.forEach { item ->
+            ChecklistItem(
+                title = item,
+                checked = checklist[item] == true,
+                onCheckedChange = { checked ->
+                    checklist = checklist + (item to checked)
+                    scope.launch {
+                        checklistRepository.setItem(
+                            staffId = staff.id,
+                            staffName = staff.name,
+                            date = checklistDate,
+                            item = item,
+                            checked = checked
+                        )
+                    }
+                }
+            )
+        }
+
+        Spacer(
+            modifier = Modifier.height(24.dp)
+        )
     }
 }
+
 /* ============================================================
-   ADD ChecklistItem
+   CHECKLIST ITEM
    ============================================================ */
+
 @Composable
 fun ChecklistItem(
-    title: String
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
 ) {
-    var checked by remember {
-        mutableStateOf(false)
-    }
 
-    androidx.compose.foundation.layout.Row(
+    Row(
         verticalAlignment =
             Alignment.CenterVertically
     ) {
 
         androidx.compose.material3.Checkbox(
             checked = checked,
-            onCheckedChange = {
-                checked = it
-            }
+            onCheckedChange = onCheckedChange
         )
 
         Text(
@@ -2392,71 +2299,6 @@ fun ChecklistItem(
     }
 }
 
-private fun parseWorkshopTime(
-    time: String?
-): Date? {
-
-    if (time == null) {
-        return null
-    }
-
-    return try {
-
-        val timeFormat =
-            SimpleDateFormat(
-                "hh:mm a",
-                Locale.getDefault()
-            )
-
-        val parsedTime =
-            timeFormat.parse(time)
-                ?: return null
-
-        val calendar =
-            java.util.Calendar.getInstance()
-
-        val timeCalendar =
-            java.util.Calendar.getInstance()
-
-        timeCalendar.time = parsedTime
-
-        calendar.set(
-            java.util.Calendar.HOUR_OF_DAY,
-            timeCalendar.get(
-                java.util.Calendar.HOUR_OF_DAY
-            )
-        )
-
-        calendar.set(
-            java.util.Calendar.MINUTE,
-            timeCalendar.get(
-                java.util.Calendar.MINUTE
-            )
-        )
-
-        calendar.set(
-            java.util.Calendar.SECOND,
-            0
-        )
-
-        calendar.set(
-            java.util.Calendar.MILLISECOND,
-            0
-        )
-
-        calendar.time
-
-    } catch (e: Exception) {
-        null
-    }
-}
 fun formatMinutes(
     minutes: Long
-): String {
-
-    val hours = minutes / 60
-    val remainingMinutes = minutes % 60
-
-    return "${hours}h ${remainingMinutes}m"
-}
-
+): String = WorkshopTime.formatMinutes(minutes)
