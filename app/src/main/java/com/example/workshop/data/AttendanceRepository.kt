@@ -110,7 +110,55 @@ class AttendanceRepository(
         }
     }
 
+    /*
+     * The shift that is current for this staff member:
+     * today's record, or yesterday's record if that shift
+     * is still open (it ran past midnight).
+     */
+    suspend fun getCurrentAttendance(
+        staffId: Int
+    ): Attendance? {
+
+        val today =
+            getTodayAttendance(
+                staffId = staffId,
+                date = WorkshopTime.today()
+            )
+
+        if (today != null) {
+            return today
+        }
+
+        val yesterday =
+            getTodayAttendance(
+                staffId = staffId,
+                date = WorkshopTime.yesterday()
+            )
+
+        return yesterday?.takeIf {
+            it.checkInTime != null && it.checkOutTime == null
+        }
+    }
+
+    /*
+     * Today's attendance for every staff member, plus any
+     * shift from yesterday that is still open.
+     */
     suspend fun getAllTodayAttendance(
+        date: String
+    ): List<Attendance> {
+
+        val today = getAttendanceForDate(date)
+
+        val stillOpenFromYesterday =
+            getAttendanceForDate(WorkshopTime.yesterday())
+                .filter { it.checkOutTime == null }
+                .filter { open -> today.none { it.staffId == open.staffId } }
+
+        return today + stillOpenFromYesterday
+    }
+
+    private suspend fun getAttendanceForDate(
         date: String
     ): List<Attendance> {
 

@@ -4,18 +4,16 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 @Database(
     entities = [
         Staff::class,
         Admin::class,
         Attendance::class,
-        WorkshopWifiSession::class
+        WorkshopWifiSession::class,
+        ChecklistItemEntry::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class WorkshopDatabase : RoomDatabase() {
@@ -27,6 +25,8 @@ abstract class WorkshopDatabase : RoomDatabase() {
     abstract fun attendanceDao(): AttendanceDao
 
     abstract fun workshopWifiSessionDao(): WorkshopWifiSessionDao
+
+    abstract fun checklistDao(): ChecklistDao
 
     companion object {
 
@@ -50,35 +50,11 @@ abstract class WorkshopDatabase : RoomDatabase() {
 
                 INSTANCE = instance
 
-                CoroutineScope(
-                    Dispatchers.IO
-                ).launch {
-
-                    /*
-                     * Create default Admin only
-                     * if no Admin exists.
-                     */
-                    if (
-                        instance.adminDao()
-                            .getAdminCount() == 0
-                    ) {
-
-                        instance.adminDao().insert(
-                            Admin(
-                                username = "admin",
-                                password = "admin123",
-                                name = "Administrator",
-                                active = true
-                            )
-                        )
-                    }
-
-                    /*
-                     * Do NOT create a default Staff.
-                     *
-                     * Staff will be created by Admin.
-                     */
-                }
+                /*
+                 * Admin accounts now live in Firebase
+                 * (see AdminRepository). No default admin
+                 * is created in the local database.
+                 */
 
                 instance
             }

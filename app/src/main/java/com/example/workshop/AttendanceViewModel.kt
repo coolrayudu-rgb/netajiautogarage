@@ -4,15 +4,21 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.workshop.data.Attendance
 import com.example.workshop.data.AttendanceRepository
+import com.example.workshop.data.WorkshopTime
 import com.example.workshop.data.WorkshopWifiSessionRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
+/*
+ * Check-in / check-out for the staff member on this phone.
+ *
+ * "Today's attendance" is the current shift: today's
+ * record, or yesterday's if that shift is still open
+ * past midnight. All times are saved with their date
+ * (see WorkshopTime).
+ */
 class AttendanceViewModel(
     private val repository: AttendanceRepository,
     private val workshopWifiSessionRepository:
@@ -25,226 +31,116 @@ class AttendanceViewModel(
     val todayAttendance: StateFlow<Attendance?> =
         _todayAttendance.asStateFlow()
 
-    private val dateFormat =
-        SimpleDateFormat(
-            "yyyy-MM-dd",
-            Locale.getDefault()
-        )
-
-    private val timeFormat =
-        SimpleDateFormat(
-            "hh:mm a",
-            Locale.getDefault()
-        )
-
-    private fun today(): String {
-        return dateFormat.format(Date())
-    }
-
-    private fun currentTime(): String {
-        return timeFormat.format(Date())
-    }
-
     fun loadTodayAttendance(staffId: Int) {
 
         viewModelScope.launch {
-
             _todayAttendance.value =
-                repository.getTodayAttendance(
-                    staffId = staffId,
-                    date = today()
-                )
+                repository.getCurrentAttendance(staffId)
         }
     }
 
-    fun checkIn(staffId: Int) {
+    fun clear() {
+        _todayAttendance.value = null
+    }
+
+    fun checkIn(staffId: Int, onDone: () -> Unit = {}) {
 
         viewModelScope.launch {
 
             val existing =
-                repository.getTodayAttendance(
-                    staffId = staffId,
-                    date = today()
-                )
+                repository.getCurrentAttendance(staffId)
 
+            // One check-in per shift.
             if (existing != null) {
-
                 _todayAttendance.value = existing
-
+                onDone()
                 return@launch
             }
 
+            val date = WorkshopTime.today()
+            val now = WorkshopTime.now()
+
             repository.checkIn(
                 staffId = staffId,
-                date = today(),
-                time = currentTime()
+                date = date,
+                time = now
             )
 
-            _todayAttendance.value =
-                repository.getTodayAttendance(
+            // The staff member is on the workshop Wi-Fi
+            // (check-in needs it), so the first workshop
+            // session starts now.
+            if (workshopWifiSessionRepository.getActiveSession(staffId, date) == null) {
+                workshopWifiSessionRepository.startSession(
                     staffId = staffId,
-                    date = today()
+                    date = date,
+                    connectedAt = now
                 )
+            }
+
+            _todayAttendance.value =
+                repository.getCurrentAttendance(staffId)
+
+            onDone()
         }
     }
 
-    fun checkOut(staffId: Int) {
+    fun checkOut(staffId: Int, onDone: () -> Unit = {}) {
 
         viewModelScope.launch {
 
             val attendance =
-                repository.getTodayAttendance(
-                    staffId = staffId,
-                    date = today()
-                )
+                repository.getCurrentAttendance(staffId)
                     ?: return@launch
 
-            /*
-             * Don't allow another checkout.
-             */
+            // Don't allow another checkout.
             if (attendance.checkOutTime != null) {
-
-                _todayAttendance.value =
-                    attendance
-
+                _todayAttendance.value = attendance
+                onDone()
                 return@launch
             }
 
-            // --------------------------------
-            // TOTAL WORKING MINUTES
-            // --------------------------------
+            val shiftDate = attendance.date
+            val now = WorkshopTime.now()
 
-            val checkInTime =
-                parseTime(
-                    attendance.checkInTime
-                )
-
-            val checkOutTime =
-                parseTime(
-                    currentTime()
-                )
-
-            val totalMinutes =
-                if (
-                    checkInTime != null &&
-                    checkOutTime != null
-                ) {
-
-                    (
-                            checkOutTime.time -
-                                    checkInTime.time
-                            ) / 60000L
-
-                } else {
-                    0L
+            // End the open workshop Wi-Fi session first.
+            workshopWifiSessionRepository
+                .getActiveSession(staffId, shiftDate)
+                ?.let { active ->
+                    workshopWifiSessionRepository.endSession(
+                        session = active,
+                        disconnectedAt = now
+                    )
                 }
 
-            // --------------------------------
-            // WORKSHOP WIFI MINUTES
-            // --------------------------------
-
-            // End any active workshop Wi-Fi session first
-            val activeSession =
-                workshopWifiSessionRepository.getActiveSession(
-                    staffId = staffId,
-                    date = today()
+            // Total working time: check-in → now (dates included).
+            val totalMinutes =
+                WorkshopTime.minutesBetween(
+                    attendance.checkInTime,
+                    now,
+                    shiftDate
                 )
 
-            if (activeSession != null) {
-                workshopWifiSessionRepository.endSession(
-                    session = activeSession,
-                    disconnectedAt = currentTime()
-                )
-            }
-
-// Now get all today's sessions
+            // Workshop time: sum of all the shift's sessions.
             val sessions =
-                workshopWifiSessionRepository
-                    .getSessionsForDate(
-                        staffId = staffId,
-                        date = today()
-                    )
+                workshopWifiSessionRepository.getSessionsForDate(
+                    staffId = staffId,
+                    date = shiftDate
+                )
 
             val workshopMinutes =
-                sessions.sumOf { session ->
-
-                    val start =
-                        parseTime(
-                            session.connectedAt
-                        )
-
-                    val end =
-                        parseTime(
-                            session.disconnectedAt
-                        )
-
-                    if (
-                        start != null &&
-                        end != null
-                    ) {
-
-                        (
-                                end.time -
-                                        start.time
-                                ) / 60000L
-
-                    } else {
-                        0L
-                    }
-                }
-
-            // --------------------------------
-            // SAVE CHECKOUT
-            // --------------------------------
+                WorkshopTracker.workshopMinutes(sessions, shiftDate)
 
             repository.checkOut(
                 attendance = attendance,
-                time = currentTime(),
-                totalWorkingMinutes =
-                    totalMinutes,
-                workshopMinutes =
-                    workshopMinutes
+                time = now,
+                totalWorkingMinutes = totalMinutes,
+                workshopMinutes = workshopMinutes
             )
 
             _todayAttendance.value =
-                repository.getTodayAttendance(
-                    staffId = staffId,
-                    date = today()
-                )
-        }
-    }
+                repository.getCurrentAttendance(staffId)
 
-    suspend fun updateLiveTimes(
-        attendance: Attendance,
-        totalWorkingMinutes: Long,
-        workshopMinutes: Long
-    ) {
-        repository.updateLiveTimes(
-            attendance = attendance,
-            totalWorkingMinutes =
-                totalWorkingMinutes,
-            workshopMinutes =
-                workshopMinutes
-        )
-    }
-
-    private fun parseTime(
-        time: String?
-    ): Date? {
-
-        if (time == null) {
-            return null
-        }
-
-        return try {
-
-            timeFormat.parse(time)
-
-        } catch (
-            e: Exception
-        ) {
-
-            null
+            onDone()
         }
     }
 }
