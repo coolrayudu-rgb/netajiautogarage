@@ -46,12 +46,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
 import androidx.lifecycle.lifecycleScope
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import com.example.workshop.data.AdminRepository
 import com.google.firebase.FirebaseApp
+import com.google.firebase.messaging.FirebaseMessaging
 import com.example.workshop.data.Staff
 import com.example.workshop.data.StaffRepository
 import com.example.workshop.data.Attendance
@@ -60,7 +64,7 @@ import com.example.workshop.data.WorkshopWifiSessionRepository
 import com.example.workshop.data.WorkshopDatabase
 import kotlinx.coroutines.launch
 
-private const val ALLOWED_WIFI = "Airtel_House_of_adapa"
+private const val ALLOWED_WIFI = "TP-Link_0E14"
 
 class MainActivity : ComponentActivity() {
 
@@ -101,10 +105,43 @@ class MainActivity : ComponentActivity() {
             refreshWifi()
         }
 
+    private val notificationPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            android.util.Log.d(
+                "GARAGE_NOTIFICATION",
+                "Notification permission granted: $granted"
+            )
+
+            if (granted) {
+                showTestNotification()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         FirebaseApp.initializeApp(this)
+        createNotificationChannel()
+
+        FirebaseMessaging.getInstance().token
+            .addOnCompleteListener { task ->
+                if (!task.isSuccessful) {
+                    android.util.Log.w(
+                        "GARAGE_FCM",
+                        "Fetching FCM token failed",
+                        task.exception
+                    )
+                    return@addOnCompleteListener
+                }
+
+                val token = task.result
+                android.util.Log.d(
+                    "GARAGE_FCM",
+                    "FCM registration token: $token"
+                )
+            }
 
         database = WorkshopDatabase.getDatabase(this)
 
@@ -141,6 +178,61 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                "garage_notifications",
+                "Garage Notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Staff check-ins and workshop alerts"
+            }
+
+            val manager = getSystemService(
+                NotificationManager::class.java
+            )
+
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showTestNotification() {
+        val notification = NotificationCompat.Builder(
+            this,
+            "garage_notifications"
+        )
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Nethaji Auto Garage")
+            .setContentText("Test notification is working!")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+
+        val manager = getSystemService(
+            Context.NOTIFICATION_SERVICE
+        ) as NotificationManager
+
+        manager.notify(1001, notification)
+    }
+
+    fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (!granted) {
+                notificationPermissionLauncher.launch(
+                    Manifest.permission.POST_NOTIFICATIONS
+                )
+                return
+            }
+        }
+
+        showTestNotification()
     }
 
     private fun checkWifiPermissions(): Boolean {
@@ -363,7 +455,7 @@ fun WorkshopApp(
             "staffLogin" -> "home"
             "adminDashboard" -> "home"
             "staffManagement" -> "adminDashboard"
-            "staffHome" -> "home"
+            "staffHome" -> "staffHome"
             else -> "home"
         }
     }
@@ -423,7 +515,10 @@ fun WorkshopApp(
 
                 onStaffLogin = {
                     screen = "staffLogin"
-                }
+                },
+                onTestNotification = {
+                    activity.requestNotificationPermission()
+                },
             )
         }
 
@@ -552,7 +647,8 @@ fun HomeScreen(
     wifiConnected: Boolean,
     onRefreshWifi: () -> Unit,
     onAdminLogin: () -> Unit,
-    onStaffLogin: () -> Unit
+    onStaffLogin: () -> Unit,
+    onTestNotification: () -> Unit
 ) {
 
     Column(
@@ -638,6 +734,17 @@ fun HomeScreen(
             onClick = onRefreshWifi
         ) {
             Text("Refresh Wi-Fi Status")
+        }
+
+        Spacer(
+            modifier = Modifier.height(12.dp)
+        )
+
+        OutlinedButton(
+            onClick = onTestNotification,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Test Notification")
         }
     }
 }
@@ -1999,6 +2106,7 @@ fun StaffHomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.Top
     ) {
